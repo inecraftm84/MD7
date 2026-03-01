@@ -3,91 +3,86 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <openssl/sha.h>
 
-typedef struct {
-    unsigned long state;
-} MyRng;
+typedef unsigned long long u64;
 
-void my_seed(MyRng *r, unsigned long seed) { r->state = seed; }
-unsigned long my_rand(MyRng *r) {
-    r->state = (r->state * 1103515245 + 12345) & 0x7FFFFFFF;
-    return r->state;
+u64 crunch(u64 h) {
+    h ^= (h >> 31);
+    h *= 0x7FB5D329728EA1E1ULL;
+    h ^= (h >> 27);
+    h *= 0xAB435E0DA5F710ULL;
+    h ^= (h >> 33);
+    return h;
 }
 
-unsigned int rotl(unsigned int value, int shift) {
-    return (value << shift) | (value >> (32 - shift));
+u64 rotl64(u64 v, int s) {
+    return (v << (s & 63)) | (v >> ((-s) & 63));
 }
 
-void md7_c(const char *path) {
-    struct stat st_file;
-    if (stat(path, &st_file) != 0) {
-        printf("Error: Cannot access '%s'\n", path);
-        return;
-    }
+void md7_phantom_unicode(const char *p) {
+    struct stat st_f;
+    if (stat(p, &st_f) != 0) return;
 
-    clock_t start = clock();
-    long s_b = st_file.st_size;
-    char *n = strrchr(path, '/') ? strrchr(path, '/') + 1 : (char *)path;
+    clock_t t = clock();
+    u64 s_b = (u64)st_f.st_size;
+    char *n = strrchr(p, '/') ? strrchr(p, '/') + 1 : (char *)p;
     int n_l = strlen(n);
 
-    unsigned char h_head[1024] = {0}, h_tail[1024] = {0};
-    FILE *f = fopen(path, "rb");
-    if (!f) return;
-    size_t head_sz = fread(h_head, 1, 1024, f);
-    size_t tail_sz = 0;
-    if (s_b > 1024) {
-        fseek(f, -((s_b - 1024 < 1024) ? s_b - 1024 : 1024), SEEK_END);
-        tail_sz = fread(h_tail, 1, 1024, f);
-    }
-    fclose(f);
+    u64 st[4] = {
+        0xCBF29CE484222325ULL ^ s_b,
+        0x517CC1B727220A95ULL ^ n_l,
+        0x13198A2E03707344ULL ^ crunch(s_b),
+        0xBE5466CF34E90C6CULL ^ 0xFEEDFACECAFEBEEFULL
+    };
 
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256_CTX sha256;
-    SHA256_Init(&sha256);
-    SHA256_Update(&sha256, h_head, head_sz);
-    SHA256_Update(&sha256, h_tail, tail_sz);
-    SHA256_Update(&sha256, n, n_l);
-    SHA256_Final(hash, &sha256);
-
-    unsigned int st = (hash[0] << 24) | (hash[1] << 16) | (hash[2] << 8) | hash[3];
-    MyRng rng;
-    my_seed(&rng, st ^ (unsigned int)s_b);
-
-    unsigned int bp[5] = {(s_b>>16)&0xFFFF, (s_b>>8)&0xFF, (s_b>>4)&0x0F, (s_b>>2)&0x03, s_b&0x01};
-    
-    for (int i = 0; i < 32 * n_l; i++) {
-        for (int j = 4; j > 0; j--) {
-            int r_idx = my_rand(&rng) % (j + 1);
-            unsigned int tmp = bp[j]; bp[j] = bp[r_idx]; bp[r_idx] = tmp;
+    FILE *f = fopen(p, "rb");
+    if (f) {
+        unsigned char b[4096];
+        size_t r; u64 total = 0;
+        u64 seed = crunch(s_b ^ 0xDEADBEEF);
+        
+        while ((r = fread(b, 1, sizeof(b), f)) > 0) {
+            for (size_t i = 0; i < r; i++) {
+                st[(total + i) % 4] = crunch(st[(total + i) % 4] ^ b[i]);
+                st[(total + i + 1) % 4] ^= rotl64(st[(total + i) % 4], b[i] % 61);
+                
+                if ((i & 0x3F) == 0) {
+                    seed = crunch(seed ^ st[0]);
+                    u64 fake_unicode = (seed % 0x2BAF) + 0xAC00; 
+                    st[i % 4] ^= (fake_unicode << (i % 32));
+                    st[0] /= ((b[i] & 0x7) + 1);
+                }
+            }
+            total += r;
         }
-        for (int j = 0; j < 5; j++) {
-            int op = my_rand(&rng) % 4;
-            unsigned int v = bp[j];
-            if (op == 0) st += v;
-            else if (op == 1) st -= v;
-            else if (op == 2) st *= (v % 13 + 1);
-            else if (op == 3) st ^= v;
-            st &= 0xFFFFFFFF;
-            st = rotl(st, (my_rand(&rng) % 31) + 1);
-        }
+        fclose(f);
     }
 
-    char final_str[32];
-    sprintf(final_str, "%u", st);
-    SHA256((unsigned char*)final_str, strlen(final_str), hash);
-    
-    for(int i = 0; i < 8; i++) printf("%02X", hash[i]);
-    printf("\n%.4f ms\n", (double)(clock() - start) * 1000.0 / CLOCKS_PER_SEC);
+    u64 m_x = crunch(st[0] ^ st[3]);
+    int rounds = 2048 + (n_l * 32); 
+    for (int i = 0; i < rounds; i++) {
+        int a = i % 4, b = (i + 1) % 4, c = (i + 2) % 4, d = (i + 3) % 4;
+        
+        u64 dyn_uni = (crunch(m_x ^ i) % 0x07FF) + 0x0800;
+        st[a] ^= dyn_uni;
+
+        st[a] = rotl64(st[a], (int)((st[b] ^ m_x) % 63) + 1);
+        st[a] ^= crunch(st[c] + i);
+        
+        u64 d_p = ((st[d] ^ dyn_uni) & 0x1F) + 1;
+        st[b] = (st[b] / d_p) ^ crunch(st[a]);
+        
+        st[c] = st[c] - (m_x ^ st[d]);
+        m_x = rotl64(m_x ^ st[a], 19) ^ dyn_uni;
+    }
+
+    double d_e = (double)(clock() - t) * 1000.0 / CLOCKS_PER_SEC;
+    printf("%016llX%016llX%016llX%016llX\n%.4f ms\n", 
+           crunch(st[0]), crunch(st[1]), crunch(st[2]), crunch(st[3]), d_e);
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        printf("MD7 Tool - A MD7!\n");
-        printf("Usage: md7sum <filename>\n");
-        return 1;
-    }
-    md7_c(argv[1]);
+    if (argc < 2) return 1;
+    md7_phantom_unicode(argv[1]);
     return 0;
 }
-
